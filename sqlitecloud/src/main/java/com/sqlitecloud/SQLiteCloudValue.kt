@@ -37,7 +37,10 @@ sealed class SQLiteCloudValue(open val value: Any?, internal val typeValue: Int)
                     val buf = Charset.defaultCharset().encode(value)
                     ByteBuffer.allocateDirect(buf.limit()).put(buf)
                 }
-                is Blob -> value
+                is Blob -> value.run {
+                    position(limit())
+                    this
+                }
                 is Null -> null
             }
             buffer?.flip()

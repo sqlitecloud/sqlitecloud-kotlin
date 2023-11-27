@@ -248,10 +248,17 @@ Java_com_sqlitecloud_SQLiteCloudBridge_executeArrayCommand(
     uint32_t paramCount = env->GetArrayLength(params);
     const char **nativeParams = static_cast<const char **>(calloc(paramCount, sizeof(char *)));
     uint32_t *paramLengths = static_cast<uint32_t *>(calloc(paramCount, sizeof(uint32_t)));
+    auto paramTypes = env->GetIntArrayElements(param_types, nullptr);
     for (int i = 0; i < paramCount; i++) {
-        auto wrappedParam = env->GetObjectArrayElement(params, i);
-        nativeParams[i] = static_cast<const char *>(unwrapPointer(env, wrappedParam));
-        paramLengths[i] = env->GetDirectBufferCapacity(wrappedParam);
+        auto param = env->GetObjectArrayElement(params, i);
+        if (paramTypes[i] == VALUE_BLOB) {
+            nativeParams[i] = static_cast<const char *>(env->GetDirectBufferAddress(param));
+            paramLengths[i] = env->GetDirectBufferCapacity(param);
+        } else {
+            auto stringParam = static_cast<jstring>(param);
+            nativeParams[i] = cString(env, stringParam);
+            paramLengths[i] = env->GetStringLength(stringParam);
+        }
     }
     SQCLOUD_VALUE_TYPE *types = reinterpret_cast<SQCLOUD_VALUE_TYPE *>(env->GetIntArrayElements(
             param_types, nullptr));

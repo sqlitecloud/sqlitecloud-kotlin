@@ -3,14 +3,7 @@
 package com.sqlitecloud
 
 import com.sqlitecloud.SQLiteCloudResult.Type.*
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonDecoder
-import java.lang.Long.min
 import java.nio.ByteBuffer
-import java.nio.channels.FileChannel
-import java.nio.file.OpenOption
-import java.nio.file.Path
-import java.nio.file.StandardOpenOption
 
 typealias OpaquePointer<T> = ByteBuffer
 
@@ -136,7 +129,7 @@ internal class SQLiteCloudBridge(val logger: SQLiteCloudLogger?) {
 
     private external fun executeArrayCommand(
         query: String,
-        params: Array<ByteBuffer>,
+        params: Array<Any>,
         paramTypes: IntArray,
     ): OpaquePointer<SQLiteCloudResult>?
 
@@ -224,11 +217,11 @@ internal class SQLiteCloudBridge(val logger: SQLiteCloudLogger?) {
         val nativeResult = if (command.parameters.isEmpty()) {
             executeCommand(command.query)
         } else {
-            val params = command.parameters.mapNotNull {
-                if (it is SQLiteCloudValue.Null) {
-                    null
-                } else {
-                    it.wrapped
+            val params: Array<Any> = command.parameters.mapNotNull {
+                when (it) {
+                    is SQLiteCloudValue.Null -> null
+                    is SQLiteCloudValue.Blob -> it.value
+                    else -> it.stringValue
                 }
             }.toTypedArray()
             val types = command.parameters.mapNotNull {
