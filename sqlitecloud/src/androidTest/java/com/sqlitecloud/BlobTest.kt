@@ -74,6 +74,29 @@ class BlobTest {
     }
 
     @Test
+    fun increasingBlobFieldSizeSucceeds() = runBlocking {
+        val blobInfo = SQLiteCloudBlobInfo(table = "Test1", column = "data")
+
+        val currentSize = sql.blobFieldSizes(blobInfo = blobInfo, rowIds = listOf(1)).first()
+
+        val newSize = currentSize + 100_000
+
+        val expandBlobCommand = SQLiteCloudCommand.expandBlobField(
+            table = blobInfo.table,
+            column = blobInfo.column,
+            rowId = 1,
+            size = newSize,
+        )
+        val result = sql.execute(command = expandBlobCommand)
+
+        assertTrue(result is SQLiteCloudResult.Success)
+
+        val actualNewSize = sql.blobFieldSizes(blobInfo = blobInfo, rowIds = listOf(1)).first()
+
+        assertEquals(newSize, actualNewSize)
+    }
+
+    @Test
     fun readBlobReadsBlobField() = runBlocking {
         val blob = SQLiteCloudBlobStructure.read(
             info = SQLiteCloudBlobInfo(

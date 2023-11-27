@@ -9,17 +9,25 @@ data class SQLiteCloudCommand(
         vararg parameters: SQLiteCloudValue,
     ) : this(query, parameters.toList())
 
+    override fun toString(): String {
+        val params = parameters.toMutableList()
+        val resultString = query.replace(Regex("\\?")) {
+            params.removeAt(0).stringValue ?: "NULL"
+        }
+        return resultString
+    }
+
     companion object {
         fun expandBlobField(
             table: String,
             column: String,
             rowId: Long,
-            size: Long,
+            size: Int,
         ): SQLiteCloudCommand {
             return SQLiteCloudCommand(
                 query = "UPDATE $table SET $column = zeroblob(?) WHERE rowId = ?;",
                 parameters = listOf(
-                    SQLiteCloudValue.Integer(size),
+                    SQLiteCloudValue.Integer(size.toLong()),
                     SQLiteCloudValue.Integer(rowId)
                 ),
             )

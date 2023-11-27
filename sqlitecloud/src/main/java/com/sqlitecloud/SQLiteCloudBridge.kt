@@ -379,6 +379,8 @@ internal class SQLiteCloudBridge(val logger: SQLiteCloudLogger?) {
             }
         }
 
+        closeBlob(handle)
+
         return result
     }
 

@@ -19,11 +19,11 @@ sealed interface BlobIO {
         data class Buffer(val buffer: ByteBuffer): Write()
         data class File(val path: java.nio.file.Path): Write()
 
-        val size: Long
+        val size: Int
             get() {
                 return when (this) {
-                    is Buffer -> buffer.remaining().toLong()
-                    is File -> FileChannel.open(path).size()
+                    is Buffer -> buffer.remaining()
+                    is File -> FileChannel.open(path).size().toInt()
                 }
             }
 
