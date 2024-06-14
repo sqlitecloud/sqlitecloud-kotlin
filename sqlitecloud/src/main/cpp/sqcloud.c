@@ -56,6 +56,8 @@ int tls_init(void);
 int tls_configure(struct tls *_ctx, struct tls_config *_config);
 int tls_connect_socket(struct tls *_ctx, int _s, const char *_servername);
 int tls_close(struct tls *_ctx);
+void tls_config_insecure_noverifycert(struct tls_config *config);
+void tls_config_insecure_noverifyname(struct tls_config *config);
 int tls_config_set_ca_file(struct tls_config *_config, const char *_ca_file);
 int tls_config_set_cert_file(struct tls_config *_config,const char *_cert_file);
 int tls_config_set_key_file(struct tls_config *_config, const char *_key_file);
@@ -123,7 +125,7 @@ void tls_free(struct tls *_ctx);
 #define TLS_DEFAULT_CA_FILE                 "/etc/ssl/cert.pem"
 #else
 // linux
-#define TLS_DEFAULT_CA_FILE                 "DigiCertTLSECCP384RootG5.crt"
+#define TLS_DEFAULT_CA_FILE                 "/etc/ssl/certs/ca-certificates.crt"
 #endif
 #endif
 
@@ -168,16 +170,19 @@ struct SQCloudResult {
     uint32_t        nheader;                // number of character in the first part of the header (which is usually skipped)
     
     // used in TYPE_ROWSET only
-    uint32_t        flags;                  // rowset flags
+    uint32_t        version;                // rowset version
     uint32_t        nrows;                  // number of rows
     uint32_t        ncols;                  // number of columns
     uint32_t        ndata;                  // number of items stores in data
     char            **data;                 // data contained in the rowset
     char            **name;                 // column names
-    char            **decltype;             // column declared types (sqlite mode only)
-    char            **dbname;               // column database names (sqlite mode only)
-    char            **tblname;              // column table names (sqlite mode only)
-    char            **origname;             // column origin names (sqlite mode only)
+    char            **decltype;             // column declared types
+    char            **dbname;               // column database names
+    char            **tblname;              // column table names
+    char            **origname;             // column origin names
+    int             *notnull;               // column is not null
+    int             *prikey;                // column is primary key
+    int             *autoinc;               // column is auto increment
     uint32_t        *clen;                  // max len for each column (used to display result)
     uint32_t        maxlen;                 // max len for each row/column
     
@@ -377,18 +382,13 @@ static void *pubsub_thread (void *arg) {
             #endif
             
             internal_set_error(connection, INTERNAL_ERRCODE_NETWORK, "An error occurred while reading data: %s (%s).", strerror(errno), msg);
-            connection->callback(connection, NULL, connection->data);
+            if (connection->callback) connection->callback(connection, NULL, connection->data);
             break;
         }
         
         if (nread == 0) {
-            const char *msg = "";
-            #ifndef SQLITECLOUD_DISABLE_TLS
-            if (tls) msg = tls_error(tls);
-            #endif
-            
-            internal_set_error(connection, INTERNAL_ERRCODE_NETWORK, "An error occurred while reading data: %s (%s).", strerror(errno), msg);
-            connection->callback(connection, NULL, connection->data);
+            internal_set_error(connection, INTERNAL_ERRCODE_SOCKCLOSED, "PubSub connection closed.");
+            if (connection->callback) connection->callback(connection, NULL, connection->data);
             break;
         }
         
@@ -410,7 +410,7 @@ static void *pubsub_thread (void *arg) {
                 char *clone = mem_alloc(clen + cstart + 1);
                 if (!clone) {
                     internal_set_error(connection, INTERNAL_ERRCODE_MEMORY, "Unable to allocate memory: %d.", clen + cstart + 1);
-                    connection->callback(connection, NULL, connection->data);
+                    if (connection->callback) connection->callback(connection, NULL, connection->data);
                     break;
                 }
                 memcpy(clone, original, tread);
@@ -436,6 +436,7 @@ static void *pubsub_thread (void *arg) {
         tread = 0;
     }
     
+    if (buffer) mem_free(buffer);
     return NULL;
 }
 
@@ -493,6 +494,11 @@ static bool internal_setup_tls (SQCloudConnection *connection, SQCloudConfig *co
     struct tls_config *tls_conf = tls_config_new();
     if (!tls_conf) {
         return internal_set_error(connection, INTERNAL_ERRCODE_TLS, "Error while initializing a new TLS configuration.");
+    }
+    
+    if (config->no_verify_certificate) {
+        tls_config_insecure_noverifycert(tls_conf);
+        tls_config_insecure_noverifyname(tls_conf);
     }
     
     // loads a file containing the root certificates
@@ -763,7 +769,8 @@ static SQCloudResult *internal_parse_array (SQCloudConnection *connection, char 
     // loop from i to n to parse each data
     buffer += bstart + start1;
     for (uint32_t i=0; i<n; ++i) {
-        uint32_t len = blen - (bstart + start1), cellsize;
+        uint32_t cellsize = 0;
+        uint32_t len = blen - start1;
         char *value = internal_parse_value(buffer, &len, &cellsize);
         rowset->data[i] = (value) ? buffer : NULL;
         buffer += cellsize;
@@ -799,12 +806,20 @@ static char *internal_get_rowset_header (SQCloudResult *result, char **header, u
     return internal_parse_value(header[col], len, NULL);
 }
 
-static bool internal_parse_rowset_header (SQCloudResult *rowset, char **pbuffer, uint32_t *pblen, uint32_t ncols, uint32_t flags) {
-    if (BITCHECK(flags, SQCLOUD_ROWSET_FLAG_DATAONLY)) return true;
+static int internal_get_rowset_header_int (SQCloudResult *result, int *header, uint32_t col) {
+    if (!result || result->tag != RESULT_ROWSET) return -1;
+    if (col >= result->ncols) return -1;
+    if (header == NULL) return -1;
+    return header[col];
+}
+
+static bool internal_parse_rowset_header (SQCloudResult *rowset, char **pbuffer, uint32_t *pblen, uint32_t ncols, uint32_t version) {
+    if (version == ROWSET_TYPE_DATA_ONLY) return true;
     
     char *buffer = *pbuffer;
     uint32_t blen = *pblen;
     
+    /*
     if (BITCHECK(flags, SQCLOUD_ROWSET_FLAG_METAVM)) {
         uint32_t cstart1 = 0, cstart2 = 0, cstart3 = 0, cstart4 = 0, cstart5 = 0;
         
@@ -836,8 +851,9 @@ static bool internal_parse_rowset_header (SQCloudResult *rowset, char **pbuffer,
         rowset->n4 = n4;
         rowset->n5 = n5;
     }
+     */
     
-    // header is guarantee to contains column names (1st)
+    // header is guarantee to contain column names
     for (uint32_t i=0; i<ncols; ++i) {
         uint32_t cstart = 0;
         uint32_t len = internal_parse_number(&buffer[1], blen, &cstart);
@@ -848,7 +864,8 @@ static bool internal_parse_rowset_header (SQCloudResult *rowset, char **pbuffer,
         if (rowset->maxlen < len) rowset->maxlen = len;
     }
     
-    if (BITCHECK(flags, SQCLOUD_ROWSET_FLAG_METACOLS)) {
+    // check if additional metadata is contained
+    if (version == ROWSET_TYPE_METADATA_v1) {
         rowset->decltype = (char **) mem_alloc(ncols * sizeof(char *));
         if (!rowset->decltype) return false;
         rowset->dbname = (char **) mem_alloc(ncols * sizeof(char *));
@@ -857,8 +874,14 @@ static bool internal_parse_rowset_header (SQCloudResult *rowset, char **pbuffer,
         if (!rowset->tblname) return false;
         rowset->origname = (char **) mem_alloc(ncols * sizeof(char *));
         if (!rowset->origname) return false;
+        rowset->notnull = (int *) mem_alloc(ncols * sizeof(int));
+        if (!rowset->notnull) return false;
+        rowset->prikey = (int *) mem_alloc(ncols * sizeof(int));
+        if (!rowset->prikey) return false;
+        rowset->autoinc = (int *) mem_alloc(ncols * sizeof(int));
+        if (!rowset->autoinc) return false;
         
-        // in sqlite mode header contains column declared types (2nd)
+        // column declared types
         for (uint32_t i=0; i<ncols; ++i) {
             uint32_t cstart = 0;
             uint32_t len = internal_parse_number(&buffer[1], blen, &cstart);
@@ -867,7 +890,7 @@ static bool internal_parse_rowset_header (SQCloudResult *rowset, char **pbuffer,
             blen -= cstart + len + 1;
         }
         
-        // in sqlite mode header contains column database names (3rd)
+        // column database names
         for (uint32_t i=0; i<ncols; ++i) {
             uint32_t cstart = 0;
             uint32_t len = internal_parse_number(&buffer[1], blen, &cstart);
@@ -876,7 +899,7 @@ static bool internal_parse_rowset_header (SQCloudResult *rowset, char **pbuffer,
             blen -= cstart + len + 1;
         }
         
-        // in sqlite mode header contains column table names (4th)
+        // column table names
         for (uint32_t i=0; i<ncols; ++i) {
             uint32_t cstart = 0;
             uint32_t len = internal_parse_number(&buffer[1], blen, &cstart);
@@ -885,11 +908,41 @@ static bool internal_parse_rowset_header (SQCloudResult *rowset, char **pbuffer,
             blen -= cstart + len + 1;
         }
         
-        // in sqlite mode header contains column origin names (5th)
+        // column origin names
         for (uint32_t i=0; i<ncols; ++i) {
             uint32_t cstart = 0;
             uint32_t len = internal_parse_number(&buffer[1], blen, &cstart);
             rowset->origname[i] = buffer;
+            buffer += cstart + len + 1;
+            blen -= cstart + len + 1;
+        }
+        
+        // column not null flag
+        for (uint32_t i=0; i<ncols; ++i) {
+            uint32_t cstart = 0;
+            uint32_t value = internal_parse_number(&buffer[1], blen, &cstart);
+            rowset->notnull[i] = (int)value;
+            uint32_t len = 0;
+            buffer += cstart + len + 1;
+            blen -= cstart + len + 1;
+        }
+        
+        // column primary key flag
+        for (uint32_t i=0; i<ncols; ++i) {
+            uint32_t cstart = 0;
+            uint32_t value = internal_parse_number(&buffer[1], blen, &cstart);
+            rowset->prikey[i] = (int)value;
+            uint32_t len = 0;
+            buffer += cstart + len + 1;
+            blen -= cstart + len + 1;
+        }
+        
+        // column autoincrement key flag
+        for (uint32_t i=0; i<ncols; ++i) {
+            uint32_t cstart = 0;
+            uint32_t value = internal_parse_number(&buffer[1], blen, &cstart);
+            rowset->autoinc[i] = (int)value;
+            uint32_t len = 0;
             buffer += cstart + len + 1;
             blen -= cstart + len + 1;
         }
@@ -901,8 +954,8 @@ static bool internal_parse_rowset_header (SQCloudResult *rowset, char **pbuffer,
     return true;
 }
 
-static bool internal_parse_rowset_values (SQCloudResult *rowset, char **pbuffer, uint32_t *pblen, uint32_t index, uint32_t bound, uint32_t ncols, uint32_t flags) {
-    if (BITCHECK(flags, SQCLOUD_ROWSET_FLAG_HEADONLY)) return true;
+static bool internal_parse_rowset_values (SQCloudResult *rowset, char **pbuffer, uint32_t *pblen, uint32_t index, uint32_t bound, uint32_t ncols, uint32_t version) {
+    if (version == ROWSET_TYPE_HEADER_ONLY) return true;
     
     char *buffer = *pbuffer;
     uint32_t blen = *pblen;
@@ -922,7 +975,7 @@ static bool internal_parse_rowset_values (SQCloudResult *rowset, char **pbuffer,
 }
 
 static SQCloudResult *internal_parse_rowset (SQCloudConnection *connection, char *buffer, uint32_t blen, uint32_t bstart,
-                                             uint32_t nrows, uint32_t ncols, uint32_t flags) {
+                                             uint32_t nrows, uint32_t ncols, uint32_t version) {
     SQCloudResult *rowset = (SQCloudResult *)mem_zeroalloc(sizeof(SQCloudResult));
     if (!rowset) {
         internal_set_error(connection, INTERNAL_ERRCODE_MEMORY, "Unable to allocate memory for SQCloudResult: %d.", sizeof(SQCloudResult));
@@ -935,7 +988,7 @@ static SQCloudResult *internal_parse_rowset (SQCloudConnection *connection, char
     rowset->blen = blen;
     rowset->balloc = blen;
     rowset->nheader = bstart;
-    rowset->flags = flags;
+    rowset->version = version;
     
     rowset->nrows = nrows;
     rowset->ncols = ncols;
@@ -948,10 +1001,10 @@ static SQCloudResult *internal_parse_rowset (SQCloudConnection *connection, char
     blen -= bstart;
     
     // parse rowset header
-    if (!internal_parse_rowset_header(rowset, &buffer, &blen, ncols, flags)) goto abort_rowset;
+    if (!internal_parse_rowset_header(rowset, &buffer, &blen, ncols, version)) goto abort_rowset;
     
     // parse values (buffer and blen was updated in internal_parse_rowset_header)
-    if (!internal_parse_rowset_values(rowset, &buffer, &blen, 0, nrows * ncols, ncols, flags)) goto abort_rowset;
+    if (!internal_parse_rowset_values(rowset, &buffer, &blen, 0, nrows * ncols, ncols, version)) goto abort_rowset;
     
     return rowset;
     
@@ -966,7 +1019,7 @@ abort_rowset:
 }
 
 static SQCloudResult *internal_parse_rowset_chunck (SQCloudConnection *connection, char *buffer, uint32_t blen, uint32_t bstart, uint32_t idx,
-                                                    uint32_t nrows, uint32_t ncols, uint32_t flags) {
+                                                    uint32_t nrows, uint32_t ncols, uint32_t version) {
     SQCloudResult *rowset = connection->_chunk;
     bool first_chunk = false;
     
@@ -995,7 +1048,7 @@ static SQCloudResult *internal_parse_rowset_chunck (SQCloudConnection *connectio
     
     if (first_chunk) {
         rowset->tag = RESULT_ROWSET;
-        rowset->flags = flags;
+        rowset->version = version;
         rowset->ischunk = true;
         
         rowset->buffers = (char **)mem_zeroalloc((sizeof(char *) * DEFAULT_CHUCK_NBUFFERS));
@@ -1028,7 +1081,7 @@ static SQCloudResult *internal_parse_rowset_chunck (SQCloudConnection *connectio
         buffer += bstart;
         
         // parse rowset header
-        if (!internal_parse_rowset_header(rowset, &buffer, &blen, ncols, flags)) goto abort_rowset;
+        if (!internal_parse_rowset_header(rowset, &buffer, &blen, ncols, version)) goto abort_rowset;
     }
     
     // update total buffer size
@@ -1090,14 +1143,16 @@ static SQCloudResult *internal_parse_rowset_chunck (SQCloudConnection *connectio
     uint32_t bound = rowset->ndata + (nrows * ncols);
     
     // parse values
-    if (!internal_parse_rowset_values(rowset, &buffer, &blen, index, bound, ncols, flags)) goto abort_rowset;
+    if (!internal_parse_rowset_values(rowset, &buffer, &blen, index, bound, ncols, version)) goto abort_rowset;
     
     // this check is for internal usage only
     if (connection->fd == 0) return rowset;
     
-    // normal usage
+    #if 0
+    // January 24th, 2024 -> ACK disabled for Rowset in chunks
     // send ACK
-    if (!internal_socket_write(connection, "OK", 2, true, true)) goto abort_rowset;
+    // if (!internal_socket_write(connection, "OK", 2, true, true)) goto abort_rowset;
+    #endif
         
     // read next chunk
     return internal_socket_read (connection, true);
@@ -1111,21 +1166,12 @@ abort_rowset:
 static SQCloudResult *internal_parse_buffer (SQCloudConnection *connection, char *buffer, uint32_t blen, uint32_t cstart, bool isstatic, bool externalbuffer) {
     if (blen <= 1) return false;
     
+    bool buffer_canbe_freed = (!isstatic && !externalbuffer);
+    
     // try to check if it is a OK reply: +2 OK
     if ((blen == REPLY_OK_LEN) && (strncmp(buffer, REPLY_OK, REPLY_OK_LEN) == 0)) {
+        if (buffer_canbe_freed) mem_free(buffer);
         return &SQCloudResultOK;
-    }
-    
-    // if buffer is static (stack based allocation) then it must be duplicated
-    if (buffer[0] != CMD_ERROR && isstatic) {
-        char *clone = mem_alloc(blen);
-        if (!clone) {
-            internal_set_error(connection, INTERNAL_ERRCODE_MEMORY, "Unable to allocate memory: %d.", blen);
-            return NULL;
-        }
-        memcpy(clone, buffer, blen);
-        buffer = clone;
-        isstatic = false;
     }
     
     // check for compressed reply before the parse step
@@ -1146,11 +1192,12 @@ static SQCloudResult *internal_parse_buffer (SQCloudConnection *connection, char
         char *hstart = &buffer[cstart1 + cstart2 + cstart3 + 1];
         
         // try to allocate a buffer big enough to hold uncompressed data + raw header
-        uint32_t clonelen = ulen + (uint32_t)(hstart - buffer);
+        // 256 is an arbitrary memory cushion value
+        uint32_t clonelen = ulen + (uint32_t)(hstart - buffer) + 256;
         char *clone = mem_alloc (clonelen);
         if (!clone) {
             internal_set_error(connection, INTERNAL_ERRCODE_MEMORY, "Unable to allocate memory to uncompress buffer: %d.", clonelen);
-            if (!isstatic && !externalbuffer) mem_free(buffer);
+            if (buffer_canbe_freed) mem_free(buffer);
             return NULL;
         }
         
@@ -1161,12 +1208,12 @@ static SQCloudResult *internal_parse_buffer (SQCloudConnection *connection, char
         uint32_t rc = LZ4_decompress_safe(zdata, clone + (zdata - hstart), clen, ulen);
         if (rc <= 0 || rc != ulen) {
             internal_set_error(connection, INTERNAL_ERRCODE_GENERIC, "Unable to decompress buffer (err code: %d).", rc);
-            if (!isstatic && !externalbuffer) mem_free(buffer);
+            if (buffer_canbe_freed) mem_free(buffer);
             return NULL;
         }
         
         // decompression is OK so replace buffer
-        if (!isstatic && !externalbuffer) mem_free(buffer);
+        if (buffer_canbe_freed) mem_free(buffer);
         
         isstatic = false;
         buffer = clone;
@@ -1175,7 +1222,24 @@ static SQCloudResult *internal_parse_buffer (SQCloudConnection *connection, char
         // at this point the buffer used in the SQCloudResult is a newly allocated one (clone)
         // so externalbuffer flag must be set to false
         externalbuffer = false;
+    } else {
+        // if buffer is static (stack based allocation) then it must be duplicated
+        bool buffer_should_be_duplicated = (buffer[0] != CMD_ERROR);
+        if (buffer_should_be_duplicated && isstatic) {
+            char *clone = mem_alloc(blen);
+            if (!clone) {
+                internal_set_error(connection, INTERNAL_ERRCODE_MEMORY, "Unable to allocate memory: %d.", blen);
+                if (buffer_canbe_freed) mem_free(buffer);
+                return NULL;
+            }
+            memcpy(clone, buffer, blen);
+            buffer = clone;
+            isstatic = false;
+        }
     }
+    
+    // re-compute flag
+    buffer_canbe_freed = (!isstatic && !externalbuffer);
     
     // parse reply
     switch (buffer[0]) {
@@ -1220,7 +1284,7 @@ static SQCloudResult *internal_parse_buffer (SQCloudConnection *connection, char
             connection->errmsg[len] = 0;
             
             // check free buffer
-            if (!isstatic && !externalbuffer) mem_free(buffer);
+            if (buffer_canbe_freed) mem_free(buffer);
             return NULL;
         }
         
@@ -1229,10 +1293,10 @@ static SQCloudResult *internal_parse_buffer (SQCloudConnection *connection, char
             // CMD_ROWSET:          *LEN 0:VERSION ROWS COLS DATA
             // CMD_ROWSET_CHUNK:    /LEN IDX:VERSION ROWS COLS DATA
             uint32_t cstart1 = 0, cstart2 = 0, cstart3 = 0, cstart4 = 0;
-            uint32_t flags = 0;
+            uint32_t version = 0;
             
             internal_parse_number(&buffer[1], blen-1, &cstart1); // parse len (already parsed in blen parameter)
-            uint32_t idx = internal_parse_number_extended(&buffer[cstart1 + 1], blen-(cstart1+1), &cstart2, &flags, NULL);
+            uint32_t idx = internal_parse_number_extended(&buffer[cstart1 + 1], blen-(cstart1+1), &cstart2, &version, NULL);
             uint32_t nrows = internal_parse_number(&buffer[cstart1 + cstart2 + 1], blen-(cstart1 + cstart2 + 1), &cstart3);
             uint32_t ncols = internal_parse_number(&buffer[cstart1 + cstart2 + + cstart3 + 1], blen-(cstart1 + cstart2 + + cstart3 + 1), &cstart4);
             
@@ -1242,20 +1306,20 @@ static SQCloudResult *internal_parse_buffer (SQCloudConnection *connection, char
             SQCloudResult *res = NULL;
             // the externalbuffer flag can change in case of compressed rowset when the end chunk is received
             if (connection->_chunk) connection->_chunk->externalbuffer = externalbuffer;
-            if (buffer[0] == CMD_ROWSET) res = internal_parse_rowset(connection, buffer, blen, bstart, nrows, ncols, flags);
-            else res = internal_parse_rowset_chunck(connection, buffer, blen, bstart, idx, nrows, ncols, flags);
+            if (buffer[0] == CMD_ROWSET) res = internal_parse_rowset(connection, buffer, blen, bstart, nrows, ncols, version);
+            else res = internal_parse_rowset_chunck(connection, buffer, blen, bstart, idx, nrows, ncols, version);
             if (res) {
                 res->externalbuffer = externalbuffer;
                 if (res->ischunk && res->bcount == 1) res->bext[0] = externalbuffer;
             }
             
             // check free buffer
-            if (!res && !isstatic && !externalbuffer) mem_free(buffer);
+            if (!res && buffer_canbe_freed) mem_free(buffer);
             return res;
         }
         
         case CMD_NULL:
-            if (!isstatic && !externalbuffer) mem_free(buffer);
+            if (buffer_canbe_freed) mem_free(buffer);
             return &SQCloudResultNULL;
             
         case CMD_INT:
@@ -1265,7 +1329,7 @@ static SQCloudResult *internal_parse_buffer (SQCloudConnection *connection, char
             SQCloudResult *res = internal_rowset_type(connection, buffer, blen, 1, (buffer[0] == CMD_INT) ? RESULT_INTEGER : RESULT_FLOAT);
             if (res) res->externalbuffer = externalbuffer;
             
-            if (!res && !isstatic && !externalbuffer) mem_free(buffer);
+            if (!res && buffer_canbe_freed) mem_free(buffer);
             return res;
         }
             
@@ -1277,7 +1341,7 @@ static SQCloudResult *internal_parse_buffer (SQCloudConnection *connection, char
         }
     }
     
-    if (!isstatic && !externalbuffer) mem_free(buffer);
+    if (buffer_canbe_freed) mem_free(buffer);
     return NULL;
 }
 
@@ -1287,7 +1351,9 @@ static bool internal_socket_forward_read (SQCloudConnection *connection, bool (*
     uint32_t cstart = 0;
     uint32_t tread = 0;
     uint32_t clen = 0;
+    char type = 0;
     
+    ssize_t nread = 0;
     char *buffer = sbuffer;
     char *original = buffer;
     int fd = connection->fd;
@@ -1298,147 +1364,168 @@ static bool internal_socket_forward_read (SQCloudConnection *connection, bool (*
     while (1) {
         // perform read operation
         #ifndef SQLITECLOUD_DISABLE_TLS
-        ssize_t nread = (tls) ? tls_read(tls, buffer, blen) : readsocket(fd, buffer, blen);
+        nread = (tls) ? tls_read(tls, buffer, blen) : readsocket(fd, buffer, blen);
         if ((tls) && (nread == TLS_WANT_POLLIN || nread == TLS_WANT_POLLOUT)) continue;
         #else
-        ssize_t nread = readsocket(fd, buffer, blen);
+        nread = readsocket(fd, buffer, blen);
         #endif
+        if (nread == -1 && errno == EINTR) continue;
         
         // sanity check read
-        if (nread < 0) {
-            const char *msg = "";
-            #ifndef SQLITECLOUD_DISABLE_TLS
-            if (tls) msg = tls_error(tls);
-            #endif
-            
-            internal_set_error(connection, INTERNAL_ERRCODE_NETWORK, "An error occurred while reading data: %s (%s).", strerror(errno), msg);
-            goto abort_read;
-        }
-        
-        if (nread == 0) {
-            const char *msg = "";
-            #ifndef SQLITECLOUD_DISABLE_TLS
-            if (tls) msg = tls_error(tls);
-            #endif
-            
-            internal_set_error(connection, INTERNAL_ERRCODE_NETWORK, "Unexpected EOF found while reading data: %s (%s).", strerror(errno), msg);
-            goto abort_read;
-        }
+        if (nread <= 0) goto abort_read;
         
         // forward read to callback
         bool result = forward_cb(buffer, nread, xdata, xdata2);
         if (!result) goto abort_read;
         
-        // update internal counter
-        tread += (uint32_t)nread;
+        // read original type
+        if (type == 0) type = buffer[0];
         
-        // determine command length
-        if (clen == 0) {
-            clen = internal_parse_number (&original[1], tread-1, &cstart);
+        if (type != CMD_ROWSET_CHUNK) {
+            // update internal counter
+            tread += (uint32_t)nread;
             
-            // handle special cases
-            if ((original[0] == CMD_INT) || (original[0] == CMD_FLOAT) || (original[0] == CMD_NULL)) clen = 0;
-            else if (clen == 0) continue;
+            // determine command length
+            if (clen == 0) {
+                clen = internal_parse_number (&original[1], tread-1, &cstart);
+                
+                // handle special cases
+                if ((original[0] == CMD_INT) || (original[0] == CMD_FLOAT) || (original[0] == CMD_NULL)) clen = 0;
+                else if (clen == 0) continue;
+            }
+            
+            // check if read is complete
+            if (clen + cstart + 1 == tread) break;
+        } else {
+            const char *end_of_chunk = "/6 0 0 0 ";
+            size_t end_of_chunk_len = 9;
+            
+            if (nread >= end_of_chunk_len) {
+                if (strncmp(buffer + nread - end_of_chunk_len, end_of_chunk, end_of_chunk_len) == 0) break;
+            } else {
+                // there is an extremely rare possibility that the end of chuck was split by the TCP driver
+                // in that case we would have no way to determine the end of the rowset chunk
+                ;
+            }
         }
-        
-        // check if read is complete
-        if (clen + cstart + 1 == tread) break;
     }
     
     return true;
     
-abort_read:
+abort_read: {
+        const char *msg = "";
+        const char *format = (nread == 0) ? "Unexpected EOF found while reading data: %s (%s)." : "An error occurred while reading data: %s (%s).";
+        #ifndef SQLITECLOUD_DISABLE_TLS
+        if (tls) msg = tls_error(tls);
+        #endif
+        internal_set_error(connection, INTERNAL_ERRCODE_NETWORK, format, strerror(errno), msg);
+    }
     return false;
 }
 
-static SQCloudResult *internal_socket_read (SQCloudConnection *connection, bool mainfd) {
-    // most of the time one read will be sufficient
-    char header[4096];
-    char *buffer = (char *)&header;
-    uint32_t blen = sizeof(header);
-    uint32_t tread = 0;
+static ssize_t internal_socket_read_nbytes (int fd, void *tlsp, char *buffer, ssize_t len) {
+    ssize_t total_read = 0;
     
-    uint32_t cstart = 0;
-    uint32_t clen = 0;
+    while (1) {
+        #ifndef SQLITECLOUD_DISABLE_TLS
+        ssize_t nread = (tlsp) ? tls_read((struct tls *)tlsp, buffer + total_read, len - total_read) : readsocket(fd, buffer + total_read, len - total_read);
+        if ((tlsp) && (nread == TLS_WANT_POLLIN || nread == TLS_WANT_POLLOUT)) continue;
+        #else
+        nread = readsocket(fd, buffer + total_read, len - total_read);
+        #endif
+        if (nread == -1 && errno == EINTR) continue;
+        total_read += nread;
+        
+        if (nread <= 0) return nread;
+        if (total_read == len) break;
+    };
+    
+    return total_read;
+}
 
+static SQCloudResult *internal_socket_read (SQCloudConnection *connection, bool mainfd) {
     int fd = (mainfd) ? connection->fd : connection->pubsubfd;
     #ifndef SQLITECLOUD_DISABLE_TLS
     struct tls *tls = (mainfd) ? connection->tls_context : connection->tls_pubsub_context;
+    #else
+    void *tls = NULL;
     #endif
     
-    char *original = buffer;
+    ssize_t nread = 0;
+    uint32_t clen = 0;
+    uint32_t cstart = 0;
+    char header[64];
+    int header_index = 0;
+    
+    char *buffer = NULL;
+    char static_buffer[4096];
+    
+    // read the buffer one character at a time until a space is encountered
+    // see https://github.com/sqlitecloud/sdk/blob/master/PROTOCOL.md for more details about the protocol
+    // after this loop we can know the buffer type and len
     while (1) {
-        #ifndef SQLITECLOUD_DISABLE_TLS
-        ssize_t nread = (tls) ? tls_read(tls, buffer, blen) : readsocket(fd, buffer, blen);
-        if ((tls) && (nread == TLS_WANT_POLLIN || nread == TLS_WANT_POLLOUT)) continue;
-        #else
-        ssize_t nread = readsocket(fd, buffer, blen);
-        #endif
+        nread = internal_socket_read_nbytes(fd, tls, &header[header_index], 1);
+        if (nread <= 0) goto abort_read;
+        if (header[header_index] == ' ') break;
+        ++header_index;
         
-        if (nread < 0) {
-            const char *msg = "";
-            #ifndef SQLITECLOUD_DISABLE_TLS
-            if (tls) msg = tls_error(tls);
-            #endif
-            
-            internal_set_error(connection, INTERNAL_ERRCODE_NETWORK, "An error occurred while reading data: %s (%s).", strerror(errno), msg);
-            goto abort_read;
+        // check for malformed header
+        if (header_index >= sizeof(header)) {
+            internal_set_error(connection, INTERNAL_ERRCODE_NETWORK, "Bad protocol reply from server: unable to find buffer size (type was %c).", header[0]);
+            return NULL;
         }
-        
-        if (nread == 0) {
-            const char *msg = "";
-            #ifndef SQLITECLOUD_DISABLE_TLS
-            if (tls) msg = tls_error(tls);
-            #endif
-            
-            internal_set_error(connection, INTERNAL_ERRCODE_NETWORK, "Unexpected EOF found while reading data: %s (%s).", strerror(errno), msg);
-            goto abort_read;
-        }
-        
-        tread += (uint32_t)nread;
-        blen -= (uint32_t)nread;
-        buffer += nread;
-        
-        if (internal_has_commandlen(original[0])) {
-            // parse buffer looking for command length
-            if (clen == 0) clen = internal_parse_number (&original[1], tread-1, &cstart);
-            
-            // check special zero-length value
-            if (clen == 0) {
-                if (!internal_canbe_zerolength(original[0])) continue;
-            }
-            
-            // check if read is complete
-            // clen is the lenght parsed in the buffer
-            // cstart is the index of the first space
-            // +1 because we skipped the first character in the internal_parse_number function
-            if (clen + cstart + 1 != tread) {
-                // check buffer allocation and continue reading
-                if (clen + cstart - tread > blen) {
-                    char *clone = mem_alloc(clen + cstart + 1);
-                    if (!clone) {
-                        internal_set_error(connection, INTERNAL_ERRCODE_MEMORY, "Unable to allocate memory: %d.", clen + cstart + 1);
-                        goto abort_read;
-                    }
-                    memcpy(clone, original, tread);
-                    buffer = original = clone;
-                    blen = (clen + cstart + 1) - tread;
-                    buffer += tread;
-                }
-                continue;
-            }
-        } else {
-            // it is a command with no explicit len
-            // so make sure that the final character is a space
-            if (original[tread-1] != ' ') continue;
-        }
-        
-        // command is complete so parse it
-        return internal_parse_buffer(connection, original, tread, (clen) ? cstart : 0, (original == header), false);
     }
     
-abort_read:
-    if (original != (char *)&header) mem_free(original);
+    // parse len (if any)
+    int header_size = header_index + 1; // +1 because ++header_index; is after the break clause
+    if (internal_has_commandlen(header[0])) {
+        clen = internal_parse_number (&header[1], header_size-1, &cstart);
+        
+        // check special zero-length value
+        if (clen == 0) {
+            if (internal_canbe_zerolength(header[0])) {
+                // it is perfectly legit to have a zero-bytes string or blob
+                return internal_parse_buffer(connection, header, header_size, 0, true, false);
+            } else {
+                // we parsed a zero-length header but we command does not allow that value, so return an error
+                internal_set_error(connection, INTERNAL_ERRCODE_NETWORK, "Bad protocol reply from server: the type %c cannot have a zero length buffer.", header[0]);
+                return NULL;
+            }
+        }
+    } else {
+        // command does not have an explicit len so the header can be safely processed
+        return internal_parse_buffer(connection, header, header_size, (clen) ? cstart : 0, true, false);
+    }
+    
+    // header correctly parsed and len is greater than zero, check if allocate a buffer or use a static one
+    // the static buffer optimization was added because of the +2 OK messages
+    size_t blen = clen + header_size;
+    buffer = (blen <= sizeof(static_buffer)) ? static_buffer : mem_alloc(blen);
+    if (!buffer) {
+        internal_set_error(connection, INTERNAL_ERRCODE_MEMORY, "Unable to allocate memory: %d.", blen);
+        return NULL;
+    }
+    
+    // copy header back to buffer
+    memcpy(buffer, header, header_size);
+    
+    // read the remaing part of the command
+    nread = internal_socket_read_nbytes(fd, tls, &buffer[header_size], clen);
+    if (nread <= 0) goto abort_read;
+    
+    // command is complete so parse it
+    return internal_parse_buffer(connection, buffer, (uint32_t)blen, (clen) ? cstart : 0, (buffer == static_buffer), false);
+    
+abort_read: {
+        const char *msg = "";
+        const char *format = (nread == 0) ? "Unexpected EOF found while reading data: %s (%s)." : "An error occurred while reading data: %s (%s).";
+        #ifndef SQLITECLOUD_DISABLE_TLS
+        if (tls) msg = tls_error(tls);
+        #endif
+        internal_set_error(connection, INTERNAL_ERRCODE_NETWORK, format, strerror(errno), msg);
+    }
+    
+    if (buffer && buffer != static_buffer) mem_free(buffer);
     return NULL;
 }
 
@@ -1483,9 +1570,23 @@ static bool internal_socket_write (SQCloudConnection *connection, const char *bu
     struct tls *tls = (mainfd) ? connection->tls_context : connection->tls_pubsub_context;
     #endif
     
-    size_t written = 0;
+    
+    // optimization tip
+    // instead of writing twice to the socket (one for the header and one for the data)
+    // try to pack everything inside the same buffer, which is generally faster
+    // -12 is to reserve enough space for the header
+    char blocal[4096];
+    if (compute_header && !connection->isblob && (len < sizeof(blocal)-12)) {
+        size_t len_local = snprintf(blocal, sizeof(blocal), "+%zu %s", len, buffer);
+        if (len_local < sizeof(blocal)) {
+            len = len_local;
+            buffer = blocal;
+            compute_header = false;
+        }
+    }
     
     // write header
+    size_t written = 0;
     if (compute_header) {
         char header[32];
         char *p = header;
@@ -1563,18 +1664,23 @@ static bool internal_connect_apply_config (SQCloudConnection *connection, SQClou
     char buffer[2048];
     int len = 0;
     
+    // non-linearizable option must be executed first
+    if (config->non_linearizable) {
+        len += snprintf(&buffer[len], sizeof(buffer) - len, "SET CLIENT KEY NONLINEARIZABLE TO 1;");
+    }
+    
     if (config->username && config->password && strlen(config->username) && strlen(config->password)) {
         char *command = config->password_hashed ? "HASH" : "PASSWORD";
         len += snprintf(&buffer[len], sizeof(buffer) - len, "AUTH USER %s %s %s;", config->username,  command, config->password);
     }
     
+    if (config->api_key && strlen(config->api_key)) {
+        len += snprintf(&buffer[len], sizeof(buffer) - len, "AUTH APIKEY %s;", config->api_key);
+    }
+    
     if (config->database && strlen(config->database)) {
         if (config->db_create && !config->db_memory) len += snprintf(&buffer[len], sizeof(buffer) - len, "CREATE DATABASE %s IF NOT EXISTS;", config->database);
         len += snprintf(&buffer[len], sizeof(buffer) - len, "USE DATABASE %s;", config->database);
-    }
-    
-    if (config->sqlite_mode) {
-        len += snprintf(&buffer[len], sizeof(buffer) - len, "SET CLIENT KEY SQLITE TO 1;");
     }
     
     if (config->compression) {
@@ -1583,10 +1689,6 @@ static bool internal_connect_apply_config (SQCloudConnection *connection, SQClou
     
     if (config->zero_text) {
         len += snprintf(&buffer[len], sizeof(buffer) - len, "SET CLIENT KEY ZEROTEXT TO 1;");
-    }
-    
-    if (config->nonlinearizable) {
-        len += snprintf(&buffer[len], sizeof(buffer) - len, "SET CLIENT KEY NONLINEARIZABLE TO 1;");
     }
     
     if (config->no_blob) {
@@ -1653,8 +1755,12 @@ static bool internal_connect (SQCloudConnection *connection, const char *hostnam
         // set socket options
         int len = 1;
         setsockopt(sock_current, SOL_SOCKET, SO_KEEPALIVE, (const char *) &len, sizeof(len));
+        
+        // disable Nagle algorithm because we want our writes to be sent ASAP
+        // https://brooker.co.za/blog/2024/05/09/nagle.html
         len = 1;
         setsockopt(sock_current, IPPROTO_TCP, TCP_NODELAY, (const char *) &len, sizeof(len));
+        
         #ifdef SO_NOSIGPIPE
         len = 1;
         setsockopt(sock_current, SOL_SOCKET, SO_NOSIGPIPE, (const char *) &len, sizeof(len));
@@ -2227,10 +2333,6 @@ bool _reserved6 (SQCloudConnection *connection, const char *buffer) {
     return internal_socket_raw_write(connection, buffer);
 }
 
-SQCloudResult *_reserved7 (SQCloudConnection *connection) {
-    return internal_socket_read(connection, true);
-}
-
 bool _reserved8 (SQCloudConnection *connection, const char *dbname, const char *key, uint64_t snapshotid, bool isinternaldb, void *xdata, int64_t dbsize, int (*xCallback)(void *xdata, void *buffer, uint32_t *blen, int64_t ntot, int64_t nprogress)) {
     return internal_upload_database(connection, dbname, key, true, snapshotid, isinternaldb, xdata, dbsize, xCallback);
 }
@@ -2417,7 +2519,7 @@ SQCloudConnection *SQCloudConnectWithString (const char *s, SQCloudConfig *pconf
         
         if (rc > 0) {
             config->database = mem_string_dup(database);
-            config->db_memory = (strcmp(database, ":memory:") == 0 || strcmp(database, ":temp:") == 0);
+            config->db_memory = (strcasecmp(database, ":memory:") == 0 || strcasecmp(database, ":temp:") == 0);
         }
     }
     
@@ -2433,10 +2535,6 @@ SQCloudConnection *SQCloudConnectWithString (const char *s, SQCloudConfig *pconf
         else if (strcasecmp(key, "compression") == 0) {
             int compression = (int)strtol(value, NULL, 0);
             config->compression = (compression > 0) ? true : false;
-        }
-        else if (strcasecmp(key, "sqlite") == 0) {
-            int sqlite_mode = (int)strtol(value, NULL, 0);
-            config->sqlite_mode = (sqlite_mode > 0) ? true : false;
         }
         else if (strcasecmp(key, "zerotext") == 0) {
             int zero_text = (int)strtol(value, NULL, 0);
@@ -2455,6 +2553,14 @@ SQCloudConnection *SQCloudConnectWithString (const char *s, SQCloudConfig *pconf
             int insecure = (int)strtol(value, NULL, 0);
             config->insecure = (insecure > 0) ? true : false;
         }
+        else if (strcasecmp(key, "no_verify_certificate") == 0) {
+            int no_verify_certificate = (int)strtol(value, NULL, 0);
+            config->no_verify_certificate = (no_verify_certificate > 0) ? true : false;
+        }
+        else if ((strcasecmp(key, "non_linearizable") == 0) || (strcasecmp(key, "nonlinearizable") == 0)) {
+            int dvalue = (int)strtol(value, NULL, 0);
+            config->non_linearizable = (dvalue > 0) ? true : false;
+        }
         else if (strcasecmp(key, "root_certificate") == 0) {
             config->tls_root_certificate = mem_string_dup(value);
         }
@@ -2470,13 +2576,19 @@ SQCloudConnection *SQCloudConnectWithString (const char *s, SQCloudConfig *pconf
             config->no_blob = (no_blob > 0) ? true : false;
         }
         else if (strcasecmp(key, "maxdata") == 0) {
-            config->max_data = (int)strtol(value, NULL, 0);
+            int dvalue = (int)strtol(value, NULL, 0);
+            if (dvalue >= 0) config->max_data = dvalue;
         }
         else if (strcasecmp(key, "maxrows") == 0) {
-            config->max_rows = (int)strtol(value, NULL, 0);
+            int dvalue = (int)strtol(value, NULL, 0);
+            if (dvalue >= 0) config->max_rows = dvalue;
         }
         else if (strcasecmp(key, "maxrowset") == 0) {
-            config->max_rowset = (int)strtol(value, NULL, 0);
+            int dvalue = (int)strtol(value, NULL, 0);
+            if (dvalue >= 0) config->max_rowset = dvalue;
+        }
+        else if (strcasecmp(key, "apikey") == 0) {
+            config->api_key = mem_string_dup(value);
         }
         n += rc;
     }
@@ -2485,9 +2597,8 @@ SQCloudConnection *SQCloudConnectWithString (const char *s, SQCloudConfig *pconf
     if (pconfig) {
         if (pconfig->timeout) config->timeout = pconfig->timeout;
         if (pconfig->compression) config->compression = pconfig->compression;
-        if (pconfig->sqlite_mode) config->sqlite_mode = pconfig->sqlite_mode;
         if (pconfig->zero_text) config->zero_text = pconfig->zero_text;
-        if (pconfig->nonlinearizable) config->nonlinearizable = pconfig->nonlinearizable;
+        if (pconfig->non_linearizable) config->non_linearizable = pconfig->non_linearizable;
         if (pconfig->no_blob) config->no_blob = pconfig->no_blob;
         if (pconfig->db_create) config->db_create = pconfig->db_create;
         if (pconfig->max_data) config->max_data = pconfig->max_data;
@@ -2497,6 +2608,10 @@ SQCloudConnection *SQCloudConnectWithString (const char *s, SQCloudConfig *pconf
         if (pconfig->db_memory) {
             if (config->database) mem_free((void *)config->database);
             config->database = mem_string_dup(":memory:");
+        }
+        if (pconfig->api_key) {
+            if (config->api_key) mem_free((void *)config->api_key);
+            config->api_key = mem_string_dup(pconfig->api_key);
         }
     }
     
@@ -2893,6 +3008,33 @@ char *SQCloudRowsetColumnTblName (SQCloudResult *result, uint32_t col, uint32_t 
 
 char *SQCloudRowsetColumnOrigName (SQCloudResult *result, uint32_t col, uint32_t *len) {
     return internal_get_rowset_header(result, result->origname, col, len);
+}
+
+uint32_t SQCloudRowSetColumnNotNULL (SQCloudResult *result, uint32_t col) {
+    return internal_get_rowset_header_int(result, result->notnull, col);
+}
+
+uint32_t SQCloudRowSetColumnPrimaryKey (SQCloudResult *result, uint32_t col) {
+    return internal_get_rowset_header_int(result, result->prikey, col);
+}
+
+uint32_t SQCloudRowSetColumnAutoIncrement (SQCloudResult *result, uint32_t col) {
+    return internal_get_rowset_header_int(result, result->autoinc, col);
+}
+
+bool SQCloudRowsetCanWrite (SQCloudResult *result) {
+    // check if the rowset is not a JOIN (must have the same table)
+    char *keytable = result->tblname[0];
+    for (int i=1; i<result->ncols; ++i) {
+        if (strcmp(keytable, result->tblname[i]) != 0) return false;
+    }
+    
+    // check if contains at least a primary key
+    for (int i=0; i<result->ncols; ++i) {
+        if (result->prikey[i] == 1) return true;
+    }
+    
+    return false;
 }
 
 uint32_t SQCloudRowsetRows (SQCloudResult *result) {
@@ -3559,8 +3701,10 @@ bool SQCloudBlobReOpen (SQCloudBlob *blob, int64_t rowid) {
     if (SQCloudResultType(result) == RESULT_ERROR) {
         blob->rc = SQCloudErrorCode(blob->connection);
     }
-    
     SQCloudResultFree(result);
+    
+    // make sure to reset bytes counter
+    blob->bytes = -1;
     return (blob->rc == 0);
 }
 

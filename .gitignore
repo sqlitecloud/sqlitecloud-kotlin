@@ -35,3 +35,4 @@ google-services.json
 # Secrets
 sqlitecloud/src/androidTest/assets/secrets.json
 app/src/main/assets/secrets.json
+.DS_Store
