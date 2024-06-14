@@ -1,6 +1,6 @@
 # SQLiteCloud Kotlin Library
 
-![SQLiteCloud Logo](https://sqlitecloud.io/static/image/c19460c9ed65bc09aea9.png)
+![sqlitecloud-logo](https://github.com/sqlitecloud/sqlitecloud-kotlin/assets/3525511/392efdae-44a5-4a8c-9dd9-3eba99620108)
 
 SQLiteCloud is a powerful Kotlin library that allows you to interact with the SQLite Cloud backend server seamlessly. It provides methods for various database operations and real-time notifications. This package is designed to simplify database operations in Android applications, making it easier than ever to work with SQLite Cloud.
 
