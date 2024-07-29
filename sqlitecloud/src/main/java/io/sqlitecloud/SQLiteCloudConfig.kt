@@ -5,8 +5,9 @@ import kotlin.io.path.Path
 
 data class SQLiteCloudConfig(
     val hostname: String,
-    val username: String,
-    val password: String,
+    val username: String?,
+    val password: String?,
+    val apiKey: String?,
     val port: Int = defaultPort,
     val family: Family = Family.IPv4,
     val passwordHashed: Boolean = false,
@@ -29,7 +30,13 @@ data class SQLiteCloudConfig(
     val clientCertificateKey: String? = null,
 ) {
     val connectionString: String
-        get() = "sqlitecloud://$username:****@$hostname:$port/${dbname ?: ""}"
+        get() {
+            if (apiKey != null) {
+                return "sqlitecloud://$hostname:$port/${dbname ?: ""}?apikey=$apiKey"
+            } else {
+                return "sqlitecloud://${username ?: ""}:****@$hostname:$port/${dbname ?: ""}"
+            }
+        }
 
     companion object {
         const val defaultPort = 8860
@@ -62,6 +69,7 @@ data class SQLiteCloudConfig(
                 key to value
             } ?: emptyMap()
 
+            val apiKey = queryItems["apikey"]
             val family = queryItems["family"]
             val passwordHashed = queryItems["passwordHashed"]
             val nonlinearizable = queryItems["nonlinearizable"]
@@ -82,8 +90,9 @@ data class SQLiteCloudConfig(
 
             return SQLiteCloudConfig(
                 hostname = connectionUri.host ?: "",
-                username = userInfo?.get(0) ?: "",
-                password = userInfo?.get(1) ?: "",
+                username = userInfo?.get(0),
+                password = userInfo?.get(1),
+                apiKey = apiKey,
                 port = port,
                 dbname = dbname,
                 family = family?.toIntOrNull()

@@ -45,8 +45,9 @@ class MainActivity : ComponentActivity() {
             appContext = applicationContext,
             config = SQLiteCloudConfig(
                 hostname = secrets?.hostname ?: "",
-                username = secrets?.username ?: "",
-                password = secrets?.password ?: "",
+                username = secrets?.username,
+                password = secrets?.password,
+                apiKey = secrets?.apiKey
             ),
         )
 
