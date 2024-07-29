@@ -15,6 +15,7 @@ import org.junit.runner.RunWith
 class ConnectionTest {
     companion object {
         private val sql: SQLiteCloud = TestContext.sqliteCloud()
+        private val sqlApiKey: SQLiteCloud = TestContext.sqliteCloudApiKey()
     }
 
     @Test
@@ -26,10 +27,31 @@ class ConnectionTest {
     }
 
     @Test
+    fun connectWithValidApiKeyCredentialsSucceeds() = runBlocking {
+        sqlApiKey.connect()
+        assertTrue(sqlApiKey.isConnected)
+        sqlApiKey.disconnect()
+        assertFalse(sqlApiKey.isConnected)
+    }
+
+    @Test
     fun connectWithInvalidCredentialsThrowsSQLiteCloudError() {
         val invalidSql = SQLiteCloud(
             appContext = TestContext.context,
             config = sql.config.copy(password = "INVALID PASSWORD"),
+        )
+        assertThrows(SQLiteCloudError::class.java) {
+            runBlocking {
+                invalidSql.connect()
+            }
+        }
+    }
+
+    @Test
+    fun connectWithInvalidCredentialsApiKeyThrowsSQLiteCloudError() {
+        val invalidSql = SQLiteCloud(
+            appContext = TestContext.context,
+            config = sqlApiKey.config.copy(apiKey = "INVALID APIKEY"),
         )
         assertThrows(SQLiteCloudError::class.java) {
             runBlocking {

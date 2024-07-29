@@ -41,6 +41,22 @@ object TestContext {
             hostname = hostname,
             username = username,
             password = password,
+            apiKey = null,
+            rootCertificate = rootCertificatePath,
+        )
+    )
+
+    fun sqliteCloudApiKey(
+        hostname: String = secrets?.hostname ?: "",
+        apiKey: String = secrets?.apiKey ?: "",
+        rootCertificatePath: String = certFile.path,
+    ) = SQLiteCloud(
+        appContext = context,
+        config = SQLiteCloudConfig(
+            hostname = hostname,
+            username = null,
+            password = null,
+            apiKey = apiKey,
             rootCertificate = rootCertificatePath,
         )
     )
