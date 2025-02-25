@@ -172,6 +172,7 @@ typedef enum {
 SQCloudConnection *SQCloudConnect (const char *hostname, int port, SQCloudConfig *config);
 SQCloudConnection *SQCloudConnectWithString (const char *s, SQCloudConfig *config);
 SQCloudResult *SQCloudExec (SQCloudConnection *connection, const char *command);
+SQCloudResult *SQCloudExecRaw (SQCloudConnection *connection, const char *command, size_t len);
 SQCloudConfig *SQCloudGetConfig (SQCloudConnection *connection);
 const char *SQCloudUUID (SQCloudConnection *connection);
 void SQCloudDisconnect (SQCloudConnection *connection);
@@ -199,6 +200,7 @@ int32_t SQCloudResultInt32 (SQCloudResult *result);
 int64_t SQCloudResultInt64 (SQCloudResult *result);
 double SQCloudResultDouble (SQCloudResult *result);
 float SQCloudResultFloat (SQCloudResult *result);
+double SQCloudResultTime (SQCloudResult *result);
 void SQCloudResultFree (SQCloudResult *result);
 bool SQCloudResultIsOK (SQCloudResult *result);
 bool SQCloudResultIsError (SQCloudResult *result);
